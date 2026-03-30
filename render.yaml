@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: awana-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    autoDeploy: false
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: SESSION_TTL_HOURS
+        value: 8
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: AZURE_CLIENT_ID
+        sync: false
+      - key: AZURE_CLIENT_SECRET
+        sync: false
+      - key: AZURE_TENANT_ID
+        sync: false
+      - key: SHAREPOINT_SITE_ID
+        sync: false
+      - key: SHAREPOINT_DRIVE_ID
+        sync: false
+      - key: SHAREPOINT_FILE_ID
+        sync: false
+      - key: SESSION_SECRET
+        sync: false

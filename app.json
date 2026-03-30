@@ -1,0 +1,45 @@
+{
+  "expo": {
+    "name": "Awana Points Logger",
+    "slug": "awana-points-logger",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "scheme": "appawanapointslogger",
+    "extra": {
+      "eas": {
+        "projectId": "YOUR_EAS_PROJECT_ID"
+      }
+    },
+    "ios": {
+      "supportsTabletMode": true,
+      "bundleIdentifier": "com.awana.pointslogger",
+      "scheme": "appawanapointslogger"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.awana.pointslogger",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": {
+            "scheme": "https",
+            "host": "*.yourcompany.com",
+            "pathPrefix": "/auth"
+          },
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ]
+    },
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}
+
