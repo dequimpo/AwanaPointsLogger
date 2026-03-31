@@ -37,8 +37,12 @@ const ICON_MAP = {
 
   // Status / inline — color-responsive
   'alert-circle':        '⚠',   // U+26A0
+  'information-outline': 'ⓘ',   // U+24D8
+  'checkbox-marked-outline': '☑', // U+2611
   'cloud-check-outline': '✓',   // U+2713
   'heart-outline':       '♡',   // U+2661
+  'numeric-1-circle':    '①',   // U+2460
+  'numeric-2-circle':    '②',   // U+2461
   'numeric-3-circle':    '③',   // U+2463
   'cross':               '✝',   // U+271D  Christian cross (Awana)
   'help-circle-outline': '❓',  // U+2753 (emoji, but also works as fallback)
@@ -61,7 +65,7 @@ export default function MaterialCommunityIconCompat({
   color = '#333',
   style,
 }) {
-  const symbol = ICON_MAP[name] ?? '❓';
+  const symbol = ICON_MAP[name] ?? 'ⓘ';
   return (
     <Text
       style={[
