@@ -2,6 +2,7 @@
   "expo": {
     "name": "Awana Points Logger",
     "slug": "awana-points-logger",
+    "icon": "./assets/icon/DBDNJ_AwanaPointsLogger.png",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
@@ -25,6 +26,7 @@
     },
     "android": {
       "adaptiveIcon": {
+        "foregroundImage": "./assets/icon/DBDNJ_AwanaPointsLogger.png",
         "backgroundColor": "#ffffff"
       },
       "package": "com.awana.pointslogger",
@@ -42,7 +44,8 @@
       ]
     },
     "web": {
-      "bundler": "metro"
+      "bundler": "metro",
+      "favicon": "./assets/icon/DBDNJ_AwanaPointsLogger.png"
     }
   }
 }
