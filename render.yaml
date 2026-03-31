@@ -26,3 +26,11 @@ services:
         sync: false
       - key: SESSION_SECRET
         sync: false
+      - key: ENFORCE_GROUP_MEMBERSHIP
+        value: "true"
+      - key: FAIL_OPEN_ON_GROUP_CHECK_ERROR
+        value: "true"
+      - key: ALLOWED_GROUP_NAME
+        value: AwanaPointsLogger
+      - key: ALLOWED_GROUP_ID
+        sync: false

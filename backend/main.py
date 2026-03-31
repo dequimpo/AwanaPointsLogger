@@ -96,6 +96,24 @@ config = {
     "session_secret": os.getenv("SESSION_SECRET", "development-session-secret"),
 }
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Group access controls for app authorization.
+# - ALLOWED_GROUP_ID: preferred, immutable Entra object ID for the group.
+# - ALLOWED_GROUP_NAME: fallback display name match (default requested by user).
+# - ENFORCE_GROUP_MEMBERSHIP: when true, non-members are denied at /auth/token.
+# - FAIL_OPEN_ON_GROUP_CHECK_ERROR: when true, transient Graph permission/errors won't block sign-in.
+ALLOWED_GROUP_ID = os.getenv("ALLOWED_GROUP_ID", "").strip()
+ALLOWED_GROUP_NAME = os.getenv("ALLOWED_GROUP_NAME", "AwanaPointsLogger").strip()
+ENFORCE_GROUP_MEMBERSHIP = _env_bool("ENFORCE_GROUP_MEMBERSHIP", True)
+FAIL_OPEN_ON_GROUP_CHECK_ERROR = _env_bool("FAIL_OPEN_ON_GROUP_CHECK_ERROR", True)
+
 # Validate that environment variables are loaded
 if config["tenant_id"] == "YOUR_TENANT_ID":
     print("❌ ERROR: AZURE_TENANT_ID not loaded from .env file!")
@@ -289,6 +307,99 @@ async def fetch_signed_in_user(access_token: str) -> dict:
             import traceback
             traceback.print_exc()
             return {}
+
+
+async def check_membership_by_group_id(access_token: str, group_id: str) -> bool:
+    """Check if signed-in user is a member of specific group id via /me/checkMemberGroups."""
+    if not group_id:
+        return False
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://graph.microsoft.com/v1.0/me/checkMemberGroups",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"groupIds": [group_id]},
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(f"checkMemberGroups failed ({response.status_code}): {response.text}")
+
+        data = response.json() if response.content else {}
+        matched_ids = data.get("value") or []
+        return group_id in matched_ids
+
+
+async def check_membership_by_group_name(access_token: str, group_name: str) -> bool:
+    """Check user membership by scanning transitive groups for a display name match."""
+    if not group_name:
+        return False
+
+    target = group_name.casefold()
+    url = "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=id,displayName&$top=999"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while url:
+            response = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
+            if response.status_code != 200:
+                raise RuntimeError(f"transitiveMemberOf failed ({response.status_code}): {response.text}")
+
+            payload = response.json() if response.content else {}
+            groups = payload.get("value") or []
+            for grp in groups:
+                name = str(grp.get("displayName") or "").strip()
+                if name and name.casefold() == target:
+                    return True
+
+            url = payload.get("@odata.nextLink")
+
+    return False
+
+
+async def ensure_user_group_access(access_token: str, user: dict) -> None:
+    """Authorize app usage based on configured group controls."""
+    if not ENFORCE_GROUP_MEMBERSHIP:
+        print("ℹ️ [AuthZ] Group enforcement disabled; allowing authenticated user")
+        return
+
+    checks_attempted = 0
+    check_errors = []
+
+    if ALLOWED_GROUP_ID:
+        checks_attempted += 1
+        try:
+            if await check_membership_by_group_id(access_token, ALLOWED_GROUP_ID):
+                print(f"✅ [AuthZ] User is member of allowed group ID {ALLOWED_GROUP_ID}")
+                return
+            print(f"❌ [AuthZ] User is not member of allowed group ID {ALLOWED_GROUP_ID}")
+        except Exception as exc:
+            check_errors.append(f"group_id_check_error={str(exc)}")
+
+    if ALLOWED_GROUP_NAME:
+        checks_attempted += 1
+        try:
+            if await check_membership_by_group_name(access_token, ALLOWED_GROUP_NAME):
+                print(f"✅ [AuthZ] User is member of allowed group name '{ALLOWED_GROUP_NAME}'")
+                return
+            print(f"❌ [AuthZ] User is not member of allowed group name '{ALLOWED_GROUP_NAME}'")
+        except Exception as exc:
+            check_errors.append(f"group_name_check_error={str(exc)}")
+
+    if check_errors and FAIL_OPEN_ON_GROUP_CHECK_ERROR:
+        print("⚠️ [AuthZ] Group check errored; FAIL_OPEN enabled. Allowing sign-in.")
+        for err in check_errors:
+            print(f"⚠️ [AuthZ] {err}")
+        return
+
+    if checks_attempted == 0:
+        print("⚠️ [AuthZ] No group configured; allowing authenticated user")
+        return
+
+    user_name = user.get("displayName") or user.get("userPrincipalName") or "User"
+    target_group = ALLOWED_GROUP_NAME or ALLOWED_GROUP_ID
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=f"Access denied for {user_name}: membership in '{target_group}' is required.",
+    )
 
 
 def _is_students_header_row(row: list) -> bool:
@@ -567,6 +678,7 @@ async def authenticate_user(token_request: TokenRequest):
             )
 
         print(f"✅ [AuthToken] User verified: {graph_user.get('displayName')}")
+        await ensure_user_group_access(token_request.access_token, graph_user)
         
         user = AuthUser(
             oid=graph_user.get("id"),
