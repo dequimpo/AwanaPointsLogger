@@ -2,6 +2,7 @@ import React from 'react';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 
 export const materialCommunityIconFont = MaterialCommunityIcons.font || {};
+const glyphMap = MaterialCommunityIcons.glyphMap || {};
 
 const ICON_NAME_MAP = {
   scoreboard: 'scoreboard-outline',
@@ -10,5 +11,6 @@ const ICON_NAME_MAP = {
 
 export default function MaterialCommunityIconCompat(props) {
   const mappedName = ICON_NAME_MAP[props.name] || props.name || 'help-circle-outline';
-  return <MaterialCommunityIcons {...props} name={mappedName} />;
+  const safeName = glyphMap[mappedName] ? mappedName : 'help-circle-outline';
+  return <MaterialCommunityIcons {...props} name={safeName} />;
 }
