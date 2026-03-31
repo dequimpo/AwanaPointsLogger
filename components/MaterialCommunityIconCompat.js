@@ -1,67 +1,22 @@
 import React from 'react';
-import { Text } from 'react-native';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 
-// Font-free fallback icons to avoid web font loading issues on iPhone Safari.
-export const materialCommunityIconFont = {};
+// Export the actual font map so App.js can preload it via useFonts.
+// This ensures the icon font is fully loaded before any icons render.
+export const materialCommunityIconFont = MaterialCommunityIcons.font;
 
-const ICON_SYMBOLS = {
-  microsoft: 'M',
-  'shield-check': 'S',
-  'cloud-sync': 'C',
-  lock: 'L',
-  'alert-circle': '!',
-  'help-circle-outline': '?',
-  scoreboard: '#',
-  logout: '<',
-  'arrow-left': '<',
-  'arrow-right': '>',
-  calendar: 'D',
-  'chart-box': 'B',
-  'inbox-multiple': 'I',
-  'heart-outline': 'H',
-  'human-male': 'M',
-  'human-female': 'F',
-  hiking: 'T',
-  'book-open-variant': 'K',
-  paw: 'P',
-  'cloud-check': 'OK',
-  'cloud-alert': '!',
-  'cloud-question': '?',
-  'information-outline': 'i',
-  'numeric-1-circle': '1',
-  'numeric-2-circle': '2',
-  'numeric-3-circle': '3',
-  'checkbox-marked-outline': 'V',
-  'cloud-check-outline': 'OK',
-  'lightbulb-outline': '*',
-  cross: '+',
-  account: 'U',
+// Some icon names are unavailable in the bundled glyph map; remap them.
+const ICON_NAME_MAP = {
+  scoreboard: 'scoreboard-outline',
+  cross: 'crosshairs',
 };
 
-export default function MaterialCommunityIconCompat({
-  name,
-  size = 24,
-  color = '#000',
-  style,
-}) {
-  const symbol = ICON_SYMBOLS[name] || '?';
+// Guaranteed-present safe fallback icon name.
+const SAFE_FALLBACK = 'help-circle-outline';
+const glyphMap = MaterialCommunityIcons.glyphMap || {};
 
-  return (
-    <Text
-      style={[
-        {
-          fontSize: size,
-          lineHeight: size,
-          color,
-          fontWeight: '700',
-          textAlign: 'center',
-        },
-        style,
-      ]}
-      accessibilityRole="image"
-      accessible
-    >
-      {symbol}
-    </Text>
-  );
+export default function MaterialCommunityIconCompat({ name, ...rest }) {
+  const mapped = ICON_NAME_MAP[name] || name;
+  const safeName = glyphMap[mapped] ? mapped : SAFE_FALLBACK;
+  return <MaterialCommunityIcons name={safeName} {...rest} />;
 }
