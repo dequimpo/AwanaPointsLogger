@@ -27,8 +27,8 @@ const LOGIN_SCREEN_BUILD_MARKER = 'LoginScreen auth patch 2026-03-27T22:25Z';
 
 const FIXED_WEB_REDIRECT_URI =
   (typeof window !== 'undefined' && window.location?.origin
-    ? `${window.location.origin}/auth`
-    : process.env.EXPO_PUBLIC_WEB_REDIRECT_URI || 'http://localhost:8081/auth');
+    ? `${window.location.origin}`
+    : process.env.EXPO_PUBLIC_WEB_REDIRECT_URI || 'http://localhost:8081');
 
 const isIOSSafariWeb = () => {
   if (Platform.OS !== 'web' || typeof navigator === 'undefined') {

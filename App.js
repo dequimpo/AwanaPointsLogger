@@ -1166,7 +1166,7 @@ export default function App() {
     ...materialCommunityIconFont,
   });
 
-  const readyToRender = Platform.OS === 'web' ? true : iconsLoaded;
+  const readyToRender = iconsLoaded;
 
   if (!readyToRender) {
     return (
