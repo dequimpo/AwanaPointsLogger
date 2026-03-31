@@ -77,6 +77,44 @@ const LoginScreen = ({ onLoginSuccess }) => {
 
   useEffect(() => {
     if (!response) {
+      // Safari full-page redirects may not repopulate useAuthRequest response.
+      // Fall back to reading auth code directly from the callback URL.
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        try {
+          const url = new URL(window.location.href);
+          const codeFromUrl = url.searchParams.get('code');
+
+          if (codeFromUrl && !processedAuthCodes.has(codeFromUrl)) {
+            console.log('🔑 [LoginScreen] Fallback URL code detected, processing callback manually');
+            processedAuthCodes.add(codeFromUrl);
+
+            const savedVerifier =
+              typeof sessionStorage !== 'undefined'
+                ? sessionStorage.getItem('__awana_pkce_cv')
+                : null;
+            const codeVerifier = savedVerifier || request?.codeVerifier;
+
+            if (savedVerifier && typeof sessionStorage !== 'undefined') {
+              sessionStorage.removeItem('__awana_pkce_cv');
+            }
+
+            if (codeVerifier) {
+              void finishLogin(codeFromUrl, codeVerifier);
+
+              // Remove OAuth params from URL after processing.
+              const cleanedUrl = `${window.location.origin}${window.location.pathname}`;
+              window.history.replaceState({}, document.title, cleanedUrl);
+            } else {
+              const errorMsg = 'PKCE state lost — please try signing in again.';
+              console.error('❌ [LoginScreen]', errorMsg);
+              setError(errorMsg);
+              setLoading(false);
+            }
+          }
+        } catch (urlError) {
+          console.error('❌ [LoginScreen] Failed to process fallback callback URL:', urlError);
+        }
+      }
       return;
     }
 
