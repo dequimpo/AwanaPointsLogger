@@ -7,6 +7,7 @@ import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
+  Image,
   StyleSheet,
   TouchableOpacity,
   ActivityIndicator,
@@ -363,11 +364,10 @@ const LoginScreen = ({ onLoginSuccess }) => {
       <View style={styles.content}>
         {/* Logo Section */}
         <View style={styles.logoSection}>
-          <MaterialCommunityIcons
-            name="microsoft"
-            size={80}
-            color="#0078D4"
-            style={styles.logo}
+          <Image
+            source={require('../assets/icon/DBDNJ_AwanaPointsLogger.png')}
+            style={styles.logoImage}
+            resizeMode="contain"
           />
           <Text style={styles.title}>Awana Points Logger</Text>
           <Text style={styles.subtitle}>Microsoft 365 Integration</Text>
@@ -433,10 +433,10 @@ const LoginScreen = ({ onLoginSuccess }) => {
             />
           ) : (
             <>
-              <MaterialCommunityIcons
-                name="microsoft"
-                size={24}
-                color="white"
+              <Image
+                source={require('../assets/icon/DBDNJ_AwanaPointsLogger.png')}
+                style={styles.loginButtonLogoImage}
+                resizeMode="contain"
               />
               <Text style={styles.loginButtonText}>
                 Sign in with Microsoft 365
@@ -467,6 +467,17 @@ const styles = StyleSheet.create({
     padding: 24,
     justifyContent: 'space-between',
     alignItems: 'center',
+  },
+  logoImage: {
+    width: 80,
+    height: 80,
+    marginBottom: 12,
+  },
+  loginButtonLogoImage: {
+    width: 24,
+    height: 24,
+    marginRight: 10,
+    borderRadius: 4,
   },
   logoSection: {
     alignItems: 'center',
