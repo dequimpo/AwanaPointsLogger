@@ -59,7 +59,7 @@ const ICON_MAP = {
   'shield-check':        '✅',
   'human-male':          '👦',
   'human-female':        '👧',
-  'hiking':              '🥾',
+  'hiking':              '🏞️',
   'book-open-variant':   '📘',
   'paw':                 '🐾',
 };
