@@ -1,16 +1,67 @@
 import React from 'react';
-import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { Text } from 'react-native';
 
-export const materialCommunityIconFont = MaterialCommunityIcons.font || {};
-const glyphMap = MaterialCommunityIcons.glyphMap || {};
+// Font-free fallback icons to avoid web font loading issues on iPhone Safari.
+export const materialCommunityIconFont = {};
 
-const ICON_NAME_MAP = {
-  scoreboard: 'scoreboard-outline',
-  cross: 'crosshairs',
+const ICON_SYMBOLS = {
+  microsoft: 'M',
+  'shield-check': 'S',
+  'cloud-sync': 'C',
+  lock: 'L',
+  'alert-circle': '!',
+  'help-circle-outline': '?',
+  scoreboard: '#',
+  logout: '<',
+  'arrow-left': '<',
+  'arrow-right': '>',
+  calendar: 'D',
+  'chart-box': 'B',
+  'inbox-multiple': 'I',
+  'heart-outline': 'H',
+  'human-male': 'M',
+  'human-female': 'F',
+  hiking: 'T',
+  'book-open-variant': 'K',
+  paw: 'P',
+  'cloud-check': 'OK',
+  'cloud-alert': '!',
+  'cloud-question': '?',
+  'information-outline': 'i',
+  'numeric-1-circle': '1',
+  'numeric-2-circle': '2',
+  'numeric-3-circle': '3',
+  'checkbox-marked-outline': 'V',
+  'cloud-check-outline': 'OK',
+  'lightbulb-outline': '*',
+  cross: '+',
+  account: 'U',
 };
 
-export default function MaterialCommunityIconCompat(props) {
-  const mappedName = ICON_NAME_MAP[props.name] || props.name || 'help-circle-outline';
-  const safeName = glyphMap[mappedName] ? mappedName : 'help-circle-outline';
-  return <MaterialCommunityIcons {...props} name={safeName} />;
+export default function MaterialCommunityIconCompat({
+  name,
+  size = 24,
+  color = '#000',
+  style,
+}) {
+  const symbol = ICON_SYMBOLS[name] || '?';
+
+  return (
+    <Text
+      style={[
+        {
+          fontSize: size,
+          lineHeight: size,
+          color,
+          fontWeight: '700',
+          textAlign: 'center',
+        },
+        style,
+      ]}
+      accessibilityRole="image"
+      accessible
+    >
+      {symbol}
+    </Text>
+  );
 }
