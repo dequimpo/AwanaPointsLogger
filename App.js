@@ -19,6 +19,7 @@ import {
 } from 'react-native';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { useFonts } from 'expo-font';
 
 // Authentication & API Services
 import authService from './services/authService';
@@ -1161,6 +1162,17 @@ function MainApp() {
 
 
 export default function App() {
+  const [iconsLoaded] = useFonts(MaterialCommunityIcons.font);
+
+  if (!iconsLoaded) {
+    return (
+      <View style={[styles.appContainer, { justifyContent: 'center', alignItems: 'center' }]}>
+        <ActivityIndicator size="large" color="#0078D4" />
+        <Text style={{ marginTop: 16, color: '#666' }}>Loading assets...</Text>
+      </View>
+    );
+  }
+
   return (
     <ErrorBoundary>
       <MainApp />
