@@ -57,6 +57,11 @@ const ICON_MAP = {
   'microsoft':           '🪟',  // Windows / Microsoft (iOS 15+)
   'scoreboard':          '🏆',
   'shield-check':        '✅',
+  'human-male':          '👦',
+  'human-female':        '👧',
+  'hiking':              '🥾',
+  'book-open-variant':   '📘',
+  'paw':                 '🐾',
 };
 
 export default function MaterialCommunityIconCompat({

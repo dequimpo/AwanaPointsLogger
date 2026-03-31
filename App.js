@@ -7,6 +7,7 @@ import React, { useState, useEffect, useRef, Component } from 'react';
 import {
   View,
   Text,
+  Image,
   ScrollView,
   StyleSheet,
   TouchableOpacity,
@@ -153,7 +154,11 @@ const DateClassSelectionScreen = ({ onNavigate, onSummary, onLogout, userName, o
             </View>
             <View style={styles.headerTitleSection} pointerEvents="none">
               <View style={styles.logoContainer}>
-                <MaterialCommunityIcons name="scoreboard" size={40} color="#2C3E50" />
+                <Image
+                  source={require('./assets/icon/DBDNJ_AwanaPointsLogger.png')}
+                  style={styles.logoImage}
+                  resizeMode="contain"
+                />
                 <Text style={styles.logoText}>DBDNJ</Text>
               </View>
               <Text style={styles.title}>Awana Points Logger</Text>
@@ -1243,6 +1248,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 8,
+  },
+  logoImage: {
+    width: 42,
+    height: 42,
+    borderRadius: 8,
   },
   logoText: {
     fontSize: 18,
