@@ -14,7 +14,7 @@ import {
   Alert,
   Platform,
 } from 'react-native';
-import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
+import MaterialCommunityIcons from '../components/MaterialCommunityIconCompat';
 import * as AuthSession from 'expo-auth-session';
 import * as WebBrowser from 'expo-web-browser';
 import authService from '../services/authService';

@@ -18,8 +18,8 @@ import {
   FlatList,
 } from 'react-native';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
 import { useFonts } from 'expo-font';
+import MaterialCommunityIcons, { materialCommunityIconFont } from './components/MaterialCommunityIconCompat';
 
 // Authentication & API Services
 import authService from './services/authService';
@@ -1163,7 +1163,7 @@ function MainApp() {
 
 export default function App() {
   const [iconsLoaded] = useFonts({
-    ...MaterialCommunityIcons.font,
+    ...materialCommunityIconFont,
   });
 
   if (!iconsLoaded) {
