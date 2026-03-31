@@ -1166,7 +1166,9 @@ export default function App() {
     ...materialCommunityIconFont,
   });
 
-  if (!iconsLoaded) {
+  const readyToRender = Platform.OS === 'web' ? true : iconsLoaded;
+
+  if (!readyToRender) {
     return (
       <View style={[styles.appContainer, { justifyContent: 'center', alignItems: 'center' }]}>
         <ActivityIndicator size="large" color="#0078D4" />
