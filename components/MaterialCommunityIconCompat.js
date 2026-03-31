@@ -1,33 +1,61 @@
 import React from 'react';
 import { Platform, Text } from 'react-native';
-import MaterialCommunityIconsActual from '@expo/vector-icons/MaterialCommunityIcons';
+import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 
-export const materialCommunityIconFont = MaterialCommunityIconsActual.font;
+export const materialCommunityIconFont = MaterialIcons.font;
 
-const WEB_ICON_FALLBACKS = {
-  microsoft: '[M]',
-  'shield-check': '[S]',
-  'cloud-sync': '[C]',
-  lock: '[L]',
-  'alert-circle': '[!]',
-  'help-circle-outline': '[?]',
-  scoreboard: '[#]',
-  logout: '[>]',
-  'arrow-left': '<',
-  'arrow-right': '>',
-  calendar: '[D]',
-  'chart-box': '[=]',
-  'inbox-multiple': '[I]',
-  'heart-outline': '[H]',
-  'human-male': '[B]',
-  'human-female': '[G]',
-  hiking: '[T]',
-  'book-open-variant': '[R]',
-  paw: '[P]',
-  'cloud-check': '[OK]',
-  'cloud-alert': '[!]',
-  'cloud-question': '[?]',
+const ICON_NAME_MAP = {
+  microsoft: 'apps',
+  'shield-check': 'verified-user',
+  'cloud-sync': 'sync',
+  lock: 'lock',
+  'alert-circle': 'error-outline',
+  'help-circle-outline': 'help-outline',
+  scoreboard: 'leaderboard',
+  logout: 'logout',
+  'arrow-left': 'arrow-back',
+  'arrow-right': 'arrow-forward',
+  calendar: 'calendar-today',
+  'chart-box': 'bar-chart',
+  'inbox-multiple': 'inbox',
+  'heart-outline': 'favorite-border',
+  'human-male': 'person',
+  'human-female': 'person',
+  hiking: 'terrain',
+  'book-open-variant': 'menu-book',
+  paw: 'pets',
+  'cloud-check': 'cloud-done',
+  'cloud-alert': 'cloud-off',
+  'cloud-question': 'cloud-queue',
 };
+
+let webMaterialFontInjected = false;
+
+function ensureWebMaterialFontLoaded() {
+  if (Platform.OS !== 'web' || typeof document === 'undefined' || webMaterialFontInjected) {
+    return;
+  }
+
+  const existing = document.getElementById('material-icons-webfont');
+  if (existing) {
+    webMaterialFontInjected = true;
+    return;
+  }
+
+  const link = document.createElement('link');
+  link.id = 'material-icons-webfont';
+  link.rel = 'stylesheet';
+  link.href = 'https://fonts.googleapis.com/icon?family=Material+Icons';
+  document.head.appendChild(link);
+  webMaterialFontInjected = true;
+}
+
+function resolveIconName(name) {
+  if (!name || typeof name !== 'string') {
+    return 'help-outline';
+  }
+  return ICON_NAME_MAP[name] || name;
+}
 
 export default function MaterialCommunityIconCompat({
   name,
@@ -36,26 +64,31 @@ export default function MaterialCommunityIconCompat({
   style,
   ...rest
 }) {
+  const resolvedName = resolveIconName(name);
+
   if (Platform.OS === 'web') {
-    const fallback = WEB_ICON_FALLBACKS[name] || '[*]';
+    ensureWebMaterialFontLoaded();
+
+    // Render Material icon ligatures on web for consistent appearance.
     return (
       <Text
-        accessibilityLabel={typeof name === 'string' ? name : 'icon'}
+        accessibilityLabel={resolvedName}
         style={[
           {
-            fontSize: Math.max(10, Math.round(size * 0.6)),
+            fontFamily: 'Material Icons',
+            fontSize: size,
             color,
             lineHeight: size,
             textAlign: 'center',
-            fontWeight: '700',
+            includeFontPadding: false,
           },
           style,
         ]}
       >
-        {fallback}
+        {resolvedName.replace(/-/g, '_')}
       </Text>
     );
   }
 
-  return <MaterialCommunityIconsActual name={name} size={size} color={color} style={style} {...rest} />;
+  return <MaterialIcons name={resolvedName} size={size} color={color} style={style} {...rest} />;
 }
