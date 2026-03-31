@@ -14,7 +14,7 @@
       "apiBaseUrl": "https://awanapointslogger.onrender.com",
       "azureClientId": "6c117750-8af8-4e5f-a016-136c2430b940",
       "azureTenantId": "afdc3b01-cd69-4af3-a783-9f13cce85492",
-      "azureAuthScopes": "openid profile offline_access User.Read",
+      "azureAuthScopes": "openid profile offline_access User.Read Sites.Read.All Files.Read.All",
       "eas": {
         "projectId": "YOUR_EAS_PROJECT_ID"
       }

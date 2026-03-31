@@ -113,6 +113,7 @@ ALLOWED_GROUP_ID = os.getenv("ALLOWED_GROUP_ID", "").strip()
 ALLOWED_GROUP_NAME = os.getenv("ALLOWED_GROUP_NAME", "AwanaPointsLogger").strip()
 ENFORCE_GROUP_MEMBERSHIP = _env_bool("ENFORCE_GROUP_MEMBERSHIP", True)
 FAIL_OPEN_ON_GROUP_CHECK_ERROR = _env_bool("FAIL_OPEN_ON_GROUP_CHECK_ERROR", True)
+ENFORCE_SHAREPOINT_ACCESS = _env_bool("ENFORCE_SHAREPOINT_ACCESS", True)
 
 # Validate that environment variables are loaded
 if config["tenant_id"] == "YOUR_TENANT_ID":
@@ -355,6 +356,50 @@ async def check_membership_by_group_name(access_token: str, group_name: str) -> 
     return False
 
 
+async def check_user_sharepoint_file_access(access_token: str) -> bool:
+    """Return true when the signed-in user can read the configured SharePoint workbook."""
+    if not config["drive_id"] or not config["file_id"]:
+        raise RuntimeError("SHAREPOINT_DRIVE_ID and SHAREPOINT_FILE_ID must be configured")
+
+    file_url = (
+        f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
+        f"/items/{config['file_id']}?$select=id,name,webUrl,parentReference"
+    )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(file_url, headers={"Authorization": f"Bearer {access_token}"})
+
+    if response.status_code == 200:
+        data = response.json() if response.content else {}
+        print(f"✅ [AuthZ] SharePoint file access confirmed: {data.get('name')}")
+        return True
+
+    if response.status_code in {401, 403, 404}:
+        print(f"❌ [AuthZ] SharePoint file access denied ({response.status_code}): {response.text}")
+        return False
+
+    raise RuntimeError(f"sharepoint_file_access_check_failed ({response.status_code}): {response.text}")
+
+
+async def ensure_user_is_authorized(access_token: str, user: dict) -> None:
+    """Authorize app usage using SharePoint access first, then optional group rules."""
+    if ENFORCE_SHAREPOINT_ACCESS:
+        try:
+            if await check_user_sharepoint_file_access(access_token):
+                return
+            print("ℹ️ [AuthZ] SharePoint file access not confirmed; evaluating group fallback rules")
+        except Exception as exc:
+            if FAIL_OPEN_ON_GROUP_CHECK_ERROR:
+                print(f"⚠️ [AuthZ] SharePoint access check errored; continuing to fallback auth checks: {exc}")
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Unable to verify SharePoint access for this user.",
+                ) from exc
+
+    await ensure_user_group_access(access_token, user)
+
+
 async def ensure_user_group_access(access_token: str, user: dict) -> None:
     """Authorize app usage based on configured group controls."""
     if not ENFORCE_GROUP_MEMBERSHIP:
@@ -400,6 +445,9 @@ async def ensure_user_group_access(access_token: str, user: dict) -> None:
         status_code=status.HTTP_403_FORBIDDEN,
         detail=f"Access denied for {user_name}: membership in '{target_group}' is required.",
     )
+
+
+    
 
 
 def _is_students_header_row(row: list) -> bool:
@@ -678,7 +726,7 @@ async def authenticate_user(token_request: TokenRequest):
             )
 
         print(f"✅ [AuthToken] User verified: {graph_user.get('displayName')}")
-        await ensure_user_group_access(token_request.access_token, graph_user)
+        await ensure_user_is_authorized(token_request.access_token, graph_user)
         
         user = AuthUser(
             oid=graph_user.get("id"),

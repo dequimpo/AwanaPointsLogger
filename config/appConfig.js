@@ -12,7 +12,7 @@ const DEFAULT_AZURE_TENANT_ID = 'afdc3b01-cd69-4af3-a783-9f13cce85492';
 const authScopes = (
   process.env.EXPO_PUBLIC_AZURE_AUTH_SCOPES ||
   extra.azureAuthScopes ||
-  'openid profile offline_access User.Read'
+  'openid profile offline_access User.Read Sites.Read.All Files.Read.All'
 )
   .split(/[\s,]+/)
   .map((scope) => scope.trim())
