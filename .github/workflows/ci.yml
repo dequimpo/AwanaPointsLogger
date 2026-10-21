@@ -36,7 +36,14 @@ jobs:
           python-version: '3.11'
 
       - name: Install backend dependencies
-        run: pip install -r backend/requirements.txt
+        run: pip install -r backend/requirements-dev.txt
 
       - name: Syntax check backend
         run: python -m compileall backend
+
+      - name: Run backend tests
+        working-directory: backend
+        run: python -m pytest -q tests
+
+      - name: Audit backend dependencies
+        run: pip-audit -r backend/requirements.txt
