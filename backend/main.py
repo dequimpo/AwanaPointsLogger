@@ -3,19 +3,33 @@ DQ03252026: FastAPI backend for Awana Points Logger
 Handles Microsoft 365 SharePoint XLSX authentication and data sync
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field, StringConstraints, field_validator
+from typing import Annotated, Literal, Optional, get_args
+import asyncio
+import base64
+import hashlib
+import logging
+import re
+import threading
+import time
 import httpx
 import jwt
 import msal
 import json
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import os
 from dotenv import load_dotenv
 from jwt import PyJWTError
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("awana_points_logger")
 
 # Load environment variables from .env file - specify the path explicitly
 import os.path
@@ -31,6 +45,9 @@ app = FastAPI(title="Awana Points Logger API")
 # Determine environment
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 IS_PRODUCTION = ENVIRONMENT == "production"
+
+# Outbound HTTP timeout (seconds) for every httpx.AsyncClient.
+HTTP_TIMEOUT = 30.0
 
 # CORS configuration - restrict to specific origins in production
 allowed_origins = [
@@ -108,11 +125,15 @@ def _env_bool(name: str, default: bool) -> bool:
 # - ALLOWED_GROUP_ID: preferred, immutable Entra object ID for the group.
 # - ALLOWED_GROUP_NAME: fallback display name match (default requested by user).
 # - ENFORCE_GROUP_MEMBERSHIP: when true, non-members are denied at /auth/token.
-# - FAIL_OPEN_ON_GROUP_CHECK_ERROR: when true, transient Graph permission/errors won't block sign-in.
+# - FAIL_OPEN_ON_GROUP_CHECK_ERROR: development-only opt-in; when true, transient Graph
+#   permission/errors won't block sign-in. Always forced off in production.
 ALLOWED_GROUP_ID = os.getenv("ALLOWED_GROUP_ID", "").strip()
 ALLOWED_GROUP_NAME = os.getenv("ALLOWED_GROUP_NAME", "AwanaPointsLogger").strip()
 ENFORCE_GROUP_MEMBERSHIP = _env_bool("ENFORCE_GROUP_MEMBERSHIP", True)
-FAIL_OPEN_ON_GROUP_CHECK_ERROR = _env_bool("FAIL_OPEN_ON_GROUP_CHECK_ERROR", True)
+_fail_open_requested = _env_bool("FAIL_OPEN_ON_GROUP_CHECK_ERROR", False)
+FAIL_OPEN_ON_GROUP_CHECK_ERROR = _fail_open_requested and not IS_PRODUCTION
+if IS_PRODUCTION and _fail_open_requested:
+    print("⚠️ FAIL_OPEN_ON_GROUP_CHECK_ERROR is ignored in production; authorization errors deny sign-in")
 ENFORCE_SHAREPOINT_ACCESS = _env_bool("ENFORCE_SHAREPOINT_ACCESS", True)
 
 # Validate that environment variables are loaded
@@ -131,11 +152,58 @@ SESSION_AUDIENCE = "awana-points-logger-client"
 SESSION_ISSUER = "awana-points-logger-api"
 bearer_scheme = HTTPBearer(auto_error=False)
 
+# Entra ID access-token validation for /auth/token.
+ENTRA_JWKS_URL = f"https://login.microsoftonline.com/{config['tenant_id']}/discovery/v2.0/keys"
+JWKS_CACHE_TTL_SECONDS = 6 * 3600
+JWKS_MIN_REFRESH_INTERVAL_SECONDS = 60
+GRAPH_AUDIENCES = (
+    "https://graph.microsoft.com",
+    "https://graph.microsoft.com/",
+    "00000003-0000-0000-c000-000000000000",
+)
+ENTRA_ALLOWED_AUDIENCES = [config["client_id"], f"api://{config['client_id']}", *GRAPH_AUDIENCES]
+ENTRA_ALLOWED_ISSUERS = [
+    f"https://login.microsoftonline.com/{config['tenant_id']}/v2.0",
+    f"https://sts.windows.net/{config['tenant_id']}/",
+]
+
+# Rate limiting (in-memory; single Render instance).
+AUTH_RATE_LIMIT = os.getenv("AUTH_RATE_LIMIT", "10/minute")
+WRITE_RATE_LIMIT = os.getenv("WRITE_RATE_LIMIT", "120/minute")
+
+
+def client_ip_key(request: Request) -> str:
+    """Client IP for rate limiting. Uses the right-most X-Forwarded-For hop (set by the
+    hosting proxy) because left-most entries are client-controlled."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+    if hops:
+        return hops[-1]
+    return get_remote_address(request)
+
+
+def session_or_ip_key(request: Request) -> str:
+    """Rate-limit authenticated writes per session user (leaders often share one church IP)."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        try:
+            payload = decode_session_token(auth_header[7:].strip())
+            if payload.get("sub"):
+                return f"user:{payload['sub']}"
+        except PyJWTError:
+            pass
+    return f"ip:{client_ip_key(request)}"
+
+
+limiter = Limiter(key_func=client_ip_key)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     """Ensure CORS headers are present on all unhandled 500 errors."""
-    from fastapi.responses import JSONResponse
+    logger.error("Unhandled exception on %s %s", request.method, request.url.path, exc_info=exc)
     origin = request.headers.get("origin", "")
     headers = {}
     if origin in allowed_origins:
@@ -151,6 +219,37 @@ async def global_exception_handler(request, exc):
 if IS_PRODUCTION and config["session_secret"] == "development-session-secret":
     raise RuntimeError("SESSION_SECRET must be set in production")
 
+if IS_PRODUCTION and not ENFORCE_SHAREPOINT_ACCESS and not (
+    ENFORCE_GROUP_MEMBERSHIP and (ALLOWED_GROUP_ID or ALLOWED_GROUP_NAME)
+):
+    print("❌ No SharePoint or group authorization check is configured; all sign-ins will be denied in production")
+
+
+def log_graph_error(context: str, response: httpx.Response) -> None:
+    """Log Graph failures server-side only; never forward Graph bodies to clients."""
+    logger.warning("Graph error during %s (status=%s): %s", context, response.status_code, response.text[:2000])
+
+
+ClassName = Literal["Journey_Boys", "Journey_Girls", "Trek", "T&T", "Cubbies"]
+ALLOWED_CLASSES = list(get_args(ClassName))
+PointFlag = Annotated[int, Field(ge=0, le=1)]
+_DATE_PATTERN = re.compile(r"^(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/(\d{2}|\d{4}))$")
+_DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y")
+
+
+def validate_date_input(value: str) -> str:
+    """Accept YYYY-MM-DD (internal) or M/D/YYYY, rejecting anything that isn't a real date."""
+    text = str(value).strip()
+    if not _DATE_PATTERN.match(text):
+        raise ValueError("date must be in YYYY-MM-DD or M/D/YYYY format")
+    for fmt in _DATE_FORMATS:
+        try:
+            datetime.strptime(text, fmt)
+            return text
+        except ValueError:
+            continue
+    raise ValueError("date is not a valid calendar date")
+
 
 class TokenRequest(BaseModel):
     access_token: str
@@ -163,30 +262,41 @@ class AuthUser(BaseModel):
     tenant_id: Optional[str] = None
 
 
-class StudentUpdate(BaseModel):
-    date: str  # Format: "M/D/YYYY"
-    class_name: str  # "Journey_Boys", "Journey_Girls", "Trek", "T&T", or "Cubbies"
+class ClassDateRequest(BaseModel):
+    date: str  # Format: YYYY-MM-DD (internal) or M/D/YYYY
+    class_name: ClassName
+
+    @field_validator("date")
+    @classmethod
+    def _validate_date(cls, value: str) -> str:
+        return validate_date_input(value)
+
+
+class StudentUpdate(ClassDateRequest):
     student_name: str
     student_id: Optional[str] = None
-    attendance: Optional[int] = None  # 1 or 0/null
-    bible: Optional[int] = None
-    book_answered: Optional[int] = None
-    memory_verse: Optional[int] = None
-    participation: Optional[int] = None
-    bonus1_baf_1: Optional[int] = None
-    bonus2_baf_2: Optional[int] = None
-    bonus3_participation: Optional[int] = None
-    total_points: Optional[int] = None
+    attendance: Optional[PointFlag] = None  # 1 or 0/null
+    bible: Optional[PointFlag] = None
+    book_answered: Optional[PointFlag] = None
+    memory_verse: Optional[PointFlag] = None
+    participation: Optional[PointFlag] = None
+    bonus1_baf_1: Optional[PointFlag] = None
+    bonus2_baf_2: Optional[PointFlag] = None
+    bonus3_participation: Optional[PointFlag] = None
+    total_points: Optional[int] = None  # Ignored; server recalculates.
 
 
-class AutoPopulateRequest(BaseModel):
-    date: str  # Format: "M/D/YYYY"
-    class_name: str  # "Journey_Boys", "Journey_Girls", "Trek", "T&T", or "Cubbies"
+class NormalizedStudentUpdate(StudentUpdate):
+    """Normalized PointsLog update: student_id is required (no name lookup)."""
+    student_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
-class BootstrapRequest(BaseModel):
-    date: str  # Format: YYYY-MM-DD (internal)
-    class_name: str
+class AutoPopulateRequest(ClassDateRequest):
+    pass
+
+
+class BootstrapRequest(ClassDateRequest):
+    pass
 
 
 class AuthResponse(BaseModel):
@@ -196,28 +306,38 @@ class AuthResponse(BaseModel):
     user: AuthUser
 
 
-def get_msal_app():
-    """Initialize MSAL application for server-side auth"""
-    return msal.ConfidentialClientApplication(
-        config["client_id"],
-        authority=AUTHORITY,
-        client_credential=config["client_secret"],
-    )
+_msal_app: Optional[msal.ConfidentialClientApplication] = None
+_msal_app_lock = threading.Lock()
+
+
+def get_msal_app() -> msal.ConfidentialClientApplication:
+    """Return the shared MSAL app so its in-memory token cache is reused across requests."""
+    global _msal_app
+    if _msal_app is None:
+        with _msal_app_lock:
+            if _msal_app is None:
+                _msal_app = msal.ConfidentialClientApplication(
+                    config["client_id"],
+                    authority=AUTHORITY,
+                    client_credential=config["client_secret"],
+                )
+    return _msal_app
 
 
 async def get_graph_access_token() -> str:
-    """Get app access token for Microsoft Graph."""
-    app = get_msal_app()
-    result = app.acquire_token_for_client(scopes=GRAPH_SCOPE) or {}
-    
+    """Get app access token for Microsoft Graph (served from MSAL's cache when valid)."""
+    result = get_msal_app().acquire_token_for_client(scopes=GRAPH_SCOPE) or {}
+
     if "access_token" in result:
         return result["access_token"]
-    else:
-        raise HTTPException(status_code=401, detail="Failed to acquire access token")
+
+    logger.error("Failed to acquire Graph app token: %s", result.get("error"))
+    raise HTTPException(status_code=401, detail="Failed to acquire access token")
 
 
 def create_session_token(user: AuthUser) -> tuple[str, int]:
-    expires_at = datetime.utcnow() + timedelta(hours=SESSION_TTL_HOURS)
+    issued_at = datetime.now(timezone.utc)
+    expires_at = issued_at + timedelta(hours=SESSION_TTL_HOURS)
     payload = {
         "sub": user.oid or user.email or user.display_name,
         "name": user.display_name,
@@ -226,11 +346,21 @@ def create_session_token(user: AuthUser) -> tuple[str, int]:
         "tid": user.tenant_id,
         "iss": SESSION_ISSUER,
         "aud": SESSION_AUDIENCE,
-        "iat": datetime.utcnow(),
+        "iat": issued_at,
         "exp": expires_at,
     }
     token = jwt.encode(payload, config["session_secret"], algorithm="HS256")
     return token, SESSION_TTL_HOURS * 3600
+
+
+def decode_session_token(token: str) -> dict:
+    return jwt.decode(
+        token,
+        config["session_secret"],
+        algorithms=["HS256"],
+        audience=SESSION_AUDIENCE,
+        issuer=SESSION_ISSUER,
+    )
 
 
 def require_authenticated_user(
@@ -243,14 +373,7 @@ def require_authenticated_user(
         )
 
     try:
-        payload = jwt.decode(
-            credentials.credentials,
-            config["session_secret"],
-            algorithms=["HS256"],
-            audience=SESSION_AUDIENCE,
-            issuer=SESSION_ISSUER,
-        )
-        return payload
+        return decode_session_token(credentials.credentials)
     except PyJWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -258,56 +381,136 @@ def require_authenticated_user(
         ) from exc
 
 
-def build_auth_user(result: dict) -> AuthUser:
-    claims = result.get("id_token_claims") or {}
-    if not claims and result.get("id_token"):
-        try:
-            claims = jwt.decode(
-                result["id_token"],
-                options={"verify_signature": False, "verify_aud": False, "verify_exp": False},
-            )
-        except PyJWTError:
-            claims = {}
-    return AuthUser(
-        oid=claims.get("oid"),
-        display_name=claims.get("name") or claims.get("preferred_username") or "User",
-        email=claims.get("preferred_username") or claims.get("email"),
-        tenant_id=claims.get("tid"),
-    )
-
-
 async def fetch_signed_in_user(access_token: str) -> dict:
-    print(f"🔐 [Graph] Fetching user profile with Graph /me")
-    print(f"🔐 [Graph] Token length: {len(access_token) if access_token else 0}")
-    print(f"🔐 [Graph] Token first 50 chars: {access_token[:50] if access_token else 'NONE'}...")
-    print(f"🔐 [Graph] Token parts: {len(access_token.split('.')) if access_token else 0}")
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    print("🔐 [Graph] Fetching user profile with Graph /me")
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         try:
             response = await client.get(
                 "https://graph.microsoft.com/v1.0/me?$select=id,displayName,userPrincipalName,mail",
                 headers={"Authorization": f"Bearer {access_token}"},
             )
-            
+
             print(f"📊 [Graph] Response status: {response.status_code}")
-            print(f"📊 [Graph] Response headers: {dict(response.headers)}")
-            
+
             if response.status_code != 200:
-                print(f"❌ [Graph] Graph API error!")
-                print(f"❌ [Graph] Status code: {response.status_code}")
-                print(f"❌ [Graph] Response body: {response.text}")
-                print(f"❌ [Graph] Request headers: Authorization: Bearer {access_token[:50]}...")
+                log_graph_error("Graph /me", response)
                 return {}
-            
+
             result = response.json()
-            print(f"✅ [Graph] Successfully fetched user: {result.get('displayName')}")
+            print("✅ [Graph] Successfully fetched signed-in user")
             return result
-            
-        except Exception as e:
-            print(f"❌ [Graph] Exception during Graph API call: {str(e)}")
-            import traceback
-            traceback.print_exc()
+
+        except Exception:
+            logger.exception("Exception during Graph /me call")
             return {}
+
+
+class EntraKeyUnavailableError(Exception):
+    """Raised when Entra signing keys cannot be retrieved."""
+
+
+_jwks_cache: dict = {"keys": {}, "fetched_at": 0.0}
+_jwks_lock = asyncio.Lock()
+
+
+async def _refresh_entra_jwks() -> None:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        response = await client.get(ENTRA_JWKS_URL)
+    if response.status_code != 200:
+        raise EntraKeyUnavailableError(f"JWKS fetch failed with status {response.status_code}")
+    keys = (response.json() or {}).get("keys") or []
+    _jwks_cache["keys"] = {key["kid"]: key for key in keys if isinstance(key, dict) and key.get("kid")}
+    _jwks_cache["fetched_at"] = time.monotonic()
+
+
+async def get_entra_signing_key(kid: Optional[str]):
+    """Return the RSA public key for `kid`, refreshing the cached JWKS when stale or on key rollover."""
+    if not kid:
+        raise jwt.InvalidTokenError("Token header has no kid")
+
+    async with _jwks_lock:
+        age = time.monotonic() - _jwks_cache["fetched_at"]
+        never_fetched = _jwks_cache["fetched_at"] == 0.0
+        stale = never_fetched or age > JWKS_CACHE_TTL_SECONDS
+        unknown_kid = kid not in _jwks_cache["keys"] and age > JWKS_MIN_REFRESH_INTERVAL_SECONDS
+        if stale or unknown_kid:
+            try:
+                await _refresh_entra_jwks()
+            except EntraKeyUnavailableError:
+                raise
+            except Exception as exc:
+                raise EntraKeyUnavailableError("JWKS fetch failed") from exc
+
+        jwk = _jwks_cache["keys"].get(kid)
+
+    if not jwk:
+        raise jwt.InvalidTokenError("Unknown token signing key")
+    return jwt.PyJWK(jwk, algorithm="RS256").key
+
+
+def _b64url_decode(segment: str) -> bytes:
+    return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _graph_nonce_signed_variant(token: str) -> Optional[str]:
+    """Graph access tokens carry a `nonce` header whose SHA-256 hex digest (not the raw value)
+    was signed. Return the token with the signed header form, or None if there is no nonce."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    header_json = _b64url_decode(parts[0]).decode("utf-8")
+    nonce = json.loads(header_json).get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        return None
+    hashed = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+    signed_header_json = header_json.replace(json.dumps(nonce), json.dumps(hashed), 1)
+    return ".".join([_b64url_encode(signed_header_json.encode("utf-8")), parts[1], parts[2]])
+
+
+async def validate_entra_access_token(token: str) -> dict:
+    """Verify an Entra access token's signature (tenant JWKS) and iss/aud/exp/tid claims."""
+    header = jwt.get_unverified_header(token)
+    if header.get("alg") != "RS256":
+        raise jwt.InvalidTokenError("Unexpected token algorithm")
+
+    signing_key = await get_entra_signing_key(header.get("kid"))
+
+    candidates = []
+    nonce_variant = _graph_nonce_signed_variant(token)
+    if nonce_variant:
+        candidates.append(nonce_variant)
+    candidates.append(token)
+
+    claims = None
+    last_error: Optional[Exception] = None
+    for candidate in candidates:
+        try:
+            claims = jwt.decode(
+                candidate,
+                signing_key,
+                algorithms=["RS256"],
+                audience=ENTRA_ALLOWED_AUDIENCES,
+                issuer=ENTRA_ALLOWED_ISSUERS,
+                leeway=60,
+                options={"require": ["exp", "iss", "aud", "tid"]},
+            )
+            break
+        except jwt.InvalidSignatureError as exc:
+            last_error = exc
+            continue
+
+    if claims is None:
+        raise last_error or jwt.InvalidSignatureError("Signature verification failed")
+
+    if claims.get("tid") != config["tenant_id"]:
+        raise jwt.InvalidTokenError("Token tenant does not match configured tenant")
+
+    return claims
 
 
 async def check_membership_by_group_id(access_token: str, group_id: str) -> bool:
@@ -315,7 +518,7 @@ async def check_membership_by_group_id(access_token: str, group_id: str) -> bool
     if not group_id:
         return False
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         response = await client.post(
             "https://graph.microsoft.com/v1.0/me/checkMemberGroups",
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
@@ -338,7 +541,7 @@ async def check_membership_by_group_name(access_token: str, group_name: str) -> 
     target = group_name.casefold()
     url = "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=id,displayName&$top=999"
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         while url:
             response = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
             if response.status_code != 200:
@@ -366,7 +569,7 @@ async def check_user_sharepoint_file_access(access_token: str) -> bool:
         f"/items/{config['file_id']}?$select=id,name,webUrl,parentReference"
     )
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         response = await client.get(file_url, headers={"Authorization": f"Bearer {access_token}"})
 
     if response.status_code == 200:
@@ -381,6 +584,8 @@ async def check_user_sharepoint_file_access(access_token: str) -> bool:
     raise RuntimeError(f"sharepoint_file_access_check_failed ({response.status_code}): {response.text}")
 
 
+
+
 async def ensure_user_is_authorized(access_token: str, user: dict) -> None:
     """Authorize app usage using SharePoint access first, then optional group rules."""
     if ENFORCE_SHAREPOINT_ACCESS:
@@ -392,6 +597,7 @@ async def ensure_user_is_authorized(access_token: str, user: dict) -> None:
             if FAIL_OPEN_ON_GROUP_CHECK_ERROR:
                 print(f"⚠️ [AuthZ] SharePoint access check errored; continuing to fallback auth checks: {exc}")
             else:
+                logger.warning("SharePoint access check errored: %s", exc)
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Unable to verify SharePoint access for this user.",
@@ -400,10 +606,20 @@ async def ensure_user_is_authorized(access_token: str, user: dict) -> None:
     await ensure_user_group_access(access_token, user)
 
 
+def _deny_no_authorization_configured() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Access denied: unable to verify access for this user.",
+    )
+
+
 async def ensure_user_group_access(access_token: str, user: dict) -> None:
     """Authorize app usage based on configured group controls."""
     if not ENFORCE_GROUP_MEMBERSHIP:
-        print("ℹ️ [AuthZ] Group enforcement disabled; allowing authenticated user")
+        if IS_PRODUCTION:
+            print("❌ [AuthZ] Group enforcement disabled and SharePoint access not confirmed; denying in production")
+            _deny_no_authorization_configured()
+        print("ℹ️ [AuthZ] Group enforcement disabled; allowing authenticated user (development)")
         return
 
     checks_attempted = 0
@@ -429,14 +645,18 @@ async def ensure_user_group_access(access_token: str, user: dict) -> None:
         except Exception as exc:
             check_errors.append(f"group_name_check_error={str(exc)}")
 
+    for err in check_errors:
+        logger.warning("[AuthZ] %s", err)
+
     if check_errors and FAIL_OPEN_ON_GROUP_CHECK_ERROR:
-        print("⚠️ [AuthZ] Group check errored; FAIL_OPEN enabled. Allowing sign-in.")
-        for err in check_errors:
-            print(f"⚠️ [AuthZ] {err}")
+        print("⚠️ [AuthZ] Group check errored; FAIL_OPEN enabled (development). Allowing sign-in.")
         return
 
     if checks_attempted == 0:
-        print("⚠️ [AuthZ] No group configured; allowing authenticated user")
+        if IS_PRODUCTION:
+            print("❌ [AuthZ] No group configured and SharePoint access not confirmed; denying in production")
+            _deny_no_authorization_configured()
+        print("⚠️ [AuthZ] No group configured; allowing authenticated user (development)")
         return
 
     user_name = user.get("displayName") or user.get("userPrincipalName") or "User"
@@ -445,9 +665,6 @@ async def ensure_user_group_access(access_token: str, user: dict) -> None:
         status_code=status.HTTP_403_FORBIDDEN,
         detail=f"Access denied for {user_name}: membership in '{target_group}' is required.",
     )
-
-
-    
 
 
 def _is_students_header_row(row: list) -> bool:
@@ -475,9 +692,10 @@ async def fetch_students_used_rows(client: httpx.AsyncClient, headers: dict) -> 
     if students_response.status_code == 404:
         raise HTTPException(status_code=404, detail="Students sheet not found")
     if students_response.status_code != 200:
+        log_graph_error("fetch Students", students_response)
         raise HTTPException(
             status_code=students_response.status_code,
-            detail=f"Graph API error fetching Students: {students_response.text}",
+            detail="Graph API error fetching Students",
         )
 
     students_data = students_response.json()
@@ -511,9 +729,10 @@ async def fetch_pointslog_used_rows(client: httpx.AsyncClient, headers: dict) ->
     if response.status_code == 404:
         raise HTTPException(status_code=404, detail="PointsLog sheet not found")
     if response.status_code != 200:
+        log_graph_error("fetch PointsLog", response)
         raise HTTPException(
             status_code=response.status_code,
-            detail=f"Graph API error fetching PointsLog: {response.text}",
+            detail="Graph API error fetching PointsLog",
         )
 
     data = response.json()
@@ -539,7 +758,7 @@ def _normalize_sheet_date(value) -> str:
 
     # Excel serial date support (e.g., 45678)
     if isinstance(value, (int, float)):
-        dt = datetime.utcfromtimestamp((float(value) - 25569) * 86400)
+        dt = datetime.fromtimestamp((float(value) - 25569) * 86400, tz=timezone.utc)
         return f"{dt.month}/{dt.day}/{dt.year}"
 
     text = str(value).strip()
@@ -628,7 +847,7 @@ def calculate_total_points_from_row_values(values: list) -> int:
 
 def apply_update_to_score_values(values: list, update: StudentUpdate) -> list:
     """Overlay an incoming checkbox update onto D:K score values."""
-    score_values = list(values[:8]) if isinstance(values, list) else []
+    score_values = [safe_int(v, 0) for v in values[:8]] if isinstance(values, list) else []
     while len(score_values) < 8:
         score_values.append(0)
 
@@ -699,35 +918,41 @@ def find_pointslog_row_index(rows: list, date_value: str, student_id: str, class
 
 
 @app.post("/auth/token", response_model=AuthResponse)
-async def authenticate_user(token_request: TokenRequest):
+@limiter.limit(AUTH_RATE_LIMIT)
+async def authenticate_user(request: Request, token_request: TokenRequest):
     """
     Accept a browser-issued access token, verify identity via Graph, and issue a session.
     SPA platform tokens can only be redeemed from the browser, so the frontend
     exchanges the auth code itself and sends the resulting access_token here.
     """
     try:
-        print("\n" + "="*70)
         print("🔐 [AuthToken] POST /auth/token request received")
-        print("="*70)
-        print(f"🔐 [AuthToken] Token length: {len(token_request.access_token) if token_request.access_token else 0}")
-        print(f"🔐 [AuthToken] Token first 50 chars: {token_request.access_token[:50] if token_request.access_token else 'NONE'}...")
-        print(f"🔐 [AuthToken] Token parts (should be 3): {len(token_request.access_token.split('.')) if token_request.access_token else 0}")
-        print(f"🔐 [AuthToken] Client ID in backend: {config['client_id'][:20]}...")
-        print(f"🔐 [AuthToken] Tenant ID in backend: {config['tenant_id']}")
-        
+
         graph_user = await fetch_signed_in_user(token_request.access_token)
-        
+
         if not graph_user or "id" not in graph_user:
-            print(f"❌ [AuthToken] Graph verification failed!")
-            print(f"❌ [AuthToken] graph_user: {graph_user}")
+            print("❌ [AuthToken] Graph verification failed")
             raise HTTPException(
                 status_code=401,
                 detail="Unable to verify identity: Graph /me call failed or returned no user",
             )
 
-        print(f"✅ [AuthToken] User verified: {graph_user.get('displayName')}")
+        try:
+            claims = await validate_entra_access_token(token_request.access_token)
+        except EntraKeyUnavailableError:
+            logger.exception("Unable to load Entra signing keys")
+            raise HTTPException(status_code=503, detail="Unable to validate access token right now")
+        except PyJWTError as exc:
+            logger.warning("Rejected access token: %s", exc)
+            raise HTTPException(status_code=401, detail="Invalid access token")
+
+        if claims.get("oid") and claims.get("oid") != graph_user.get("id"):
+            logger.warning("Rejected access token: oid does not match Graph /me user")
+            raise HTTPException(status_code=401, detail="Invalid access token")
+
+        print("✅ [AuthToken] User verified")
         await ensure_user_is_authorized(token_request.access_token, graph_user)
-        
+
         user = AuthUser(
             oid=graph_user.get("id"),
             display_name=graph_user.get("displayName") or "User",
@@ -736,9 +961,8 @@ async def authenticate_user(token_request: TokenRequest):
         )
 
         session_token, expires_in = create_session_token(user)
-        print(f"✅ [AuthToken] Session token created successfully")
-        print("="*70 + "\n")
-        
+        print("✅ [AuthToken] Session token created successfully")
+
         return AuthResponse(
             access_token=session_token,
             token_type="Bearer",
@@ -747,11 +971,9 @@ async def authenticate_user(token_request: TokenRequest):
         )
     except HTTPException:
         raise
-    except Exception as e:
-        print(f"❌ [AuthToken] Exception in /auth/token: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Exception in /auth/token")
+        raise HTTPException(status_code=400, detail="Authentication failed")
 
 
 @app.get("/sheets/PointsLogSheet")
@@ -769,7 +991,7 @@ async def fetch_points_sheet(
     try:
         print("📋 Fetching PointsLogSheet (with denormalized student names)...")
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             headers = {"Authorization": f"Bearer {access_token}"}
             
             # Fetch normalized PointsLog from used range only
@@ -795,7 +1017,7 @@ async def fetch_points_sheet(
                 return {
                     "headers": rows[0] if rows else [],
                     "data": rows[1:] if len(rows) > 1 else [],
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "source": "legacy",
                 }
             
@@ -871,127 +1093,194 @@ async def fetch_points_sheet(
             return {
                 "headers": legacy_headers,
                 "data": denormalized_rows,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "source": "normalized",
             }
-    except Exception as e:
-        print(f"💥 Exception in fetch_points_sheet: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+    except Exception:
+        logger.exception("Exception in fetch_points_sheet")
+        raise HTTPException(status_code=500, detail="Server error")
+
+
+
+
+def pointslog_range_url(address: str) -> str:
+    return (
+        f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
+        f"/items/{config['file_id']}/workbook/worksheets('PointsLog')/range(address='{address}')"
+    )
+
+
+async def ensure_pointslog_rows_for_class(
+    client: httpx.AsyncClient, headers: dict, date_value: str, class_name: str
+) -> dict:
+    """Append a zeroed PointsLog row for every roster student in `class_name` that has no
+    (date, student_id, class) row yet. Returns counts; never duplicates existing rows."""
+    normalized_date = normalize_date_str(date_value)
+
+    roster = await fetch_students_roster(client, headers)
+    class_students = [s for s in roster if s["class_name"] == class_name]
+
+    if not class_students:
+        return {"date": normalized_date, "entries_created": 0, "total_students": 0}
+
+    pointslog_rows = await fetch_pointslog_rows(client, headers)
+
+    existing_keys = set()
+    for row in pointslog_rows[1:]:
+        if len(row) < 3:
+            continue
+        existing_keys.add(
+            (
+                normalize_date_str(row[0]),
+                str(row[1]).strip(),
+                str(row[2]).strip(),
+            )
+        )
+
+    new_entries = []
+    for student in class_students:
+        key = (normalized_date, student["student_id"], class_name)
+        if key in existing_keys:
+            continue
+        # [Date, StudentID, Class, Att, Bible, BA, MV, Part, B1, B2, B3, TotalPoints]
+        new_entries.append([normalized_date, student["student_id"], class_name, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+    if new_entries:
+        start_row = max(2, len(pointslog_rows) + 1)
+        end_row = start_row + len(new_entries) - 1
+        insert_response = await client.patch(
+            pointslog_range_url(f"A{start_row}:L{end_row}"),
+            json={"values": new_entries},
+            headers=headers,
+        )
+        if insert_response.status_code != 200:
+            log_graph_error("insert PointsLog rows", insert_response)
+            raise HTTPException(
+                status_code=insert_response.status_code,
+                detail="Failed to insert PointsLog rows",
+            )
+
+    return {
+        "date": normalized_date,
+        "entries_created": len(new_entries),
+        "total_students": len(class_students),
+    }
+
+
+async def apply_pointslog_update(update: StudentUpdate, access_token: str, allow_name_lookup: bool) -> dict:
+    """Upsert one student's PointsLog row with a single Graph range write."""
+    print(f"✏️ Updating points for {update.student_name} on {update.date}")
+    normalized_date = normalize_date_str(update.date)
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+
+        student_id = str(update.student_id).strip() if update.student_id else None
+        if not student_id and allow_name_lookup:
+            roster = await fetch_students_roster(client, headers)
+            for student in roster:
+                if student["student_name"] == update.student_name and student["class_name"] == update.class_name:
+                    student_id = student["student_id"]
+                    break
+
+        if not student_id:
+            raise HTTPException(status_code=404, detail=f"Student {update.student_name} not found")
+
+        pointslog_rows = await fetch_pointslog_rows(client, headers)
+        row_index = find_pointslog_row_index(pointslog_rows, normalized_date, student_id, update.class_name)
+
+        if row_index is None:
+            existing_score_values = [0] * 8
+        else:
+            existing_row = pointslog_rows[row_index - 1] if len(pointslog_rows) >= row_index else []
+            existing_score_values = existing_row[3:11] if isinstance(existing_row, list) else []
+
+        # Do not trust client total_points; server recalculates from D:K.
+        score_values = apply_update_to_score_values(existing_score_values, update)
+        computed_total = calculate_total_points_from_row_values(score_values)
+
+        if row_index is None:
+            row_index = max(2, len(pointslog_rows) + 1)
+            address = f"A{row_index}:L{row_index}"
+            row_values = [normalized_date, student_id, update.class_name, *score_values, computed_total]
+        else:
+            address = f"D{row_index}:L{row_index}"
+            row_values = [*score_values, computed_total]
+
+        write_response = await client.patch(
+            pointslog_range_url(address),
+            json={"values": [row_values]},
+            headers=headers,
+        )
+        if write_response.status_code != 200:
+            log_graph_error(f"update PointsLog {address}", write_response)
+            raise HTTPException(status_code=400, detail="Failed to update PointsLog row")
+
+        return {
+            "success": True,
+            "message": f"Updated {update.student_name} on {normalized_date}",
+            "row_updated": row_index,
+            "total_points": computed_total,
+        }
 
 
 @app.patch("/sheets/PointsLogSheet/update")
+@limiter.limit(WRITE_RATE_LIMIT, key_func=session_or_ip_key)
 async def update_student_row(
+    request: Request,
     update: StudentUpdate,
     access_token: str = Depends(get_graph_access_token),
     user_session: dict = Depends(require_authenticated_user),
 ):
     """
     Update a specific student row (backward compatible endpoint)
-    Automatically routes to normalized PointsLog update
+    Routes to the normalized PointsLog update; falls back to a roster name lookup
+    when student_id is not supplied.
     """
-    return await update_student_pointslog(update, access_token)
+    try:
+        return await apply_pointslog_update(update, access_token, allow_name_lookup=True)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Exception in update_student_row")
+        raise HTTPException(status_code=500, detail="Server error")
 
 
 @app.post("/sheets/PointsLogSheet/bootstrap")
+@limiter.limit(WRITE_RATE_LIMIT, key_func=session_or_ip_key)
 async def bootstrap_pointslog_sheet(
-    request: BootstrapRequest,
+    request: Request,
+    bootstrap_request: BootstrapRequest,
     access_token: str = Depends(get_graph_access_token),
     user_session: dict = Depends(require_authenticated_user),
 ):
     """Ensure PointsLog contains one row per class student for the selected date."""
     try:
-        normalized_date = normalize_date_str(request.date)
-
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+            result = await ensure_pointslog_rows_for_class(
+                client, headers, bootstrap_request.date, bootstrap_request.class_name
+            )
 
-            roster = await fetch_students_roster(client, headers)
-            class_students = [s for s in roster if s["class_name"] == request.class_name]
-
-            if not class_students:
-                return {
-                    "message": "No students found for this class",
-                    "entries_created": 0,
-                    "date": normalized_date,
-                    "class_name": request.class_name,
-                    "total_students": 0,
-                }
-
-            pointslog_rows = await fetch_pointslog_rows(client, headers)
-
-            existing_keys = set()
-            for row in pointslog_rows[1:]:
-                if len(row) < 3:
-                    continue
-                existing_keys.add(
-                    (
-                        normalize_date_str(row[0]),
-                        str(row[1]).strip(),
-                        str(row[2]).strip(),
-                    )
-                )
-
-            new_entries = []
-            for student in class_students:
-                key = (normalized_date, student["student_id"], request.class_name)
-                if key in existing_keys:
-                    continue
-
-                new_entries.append(
-                    [
-                        normalized_date,
-                        student["student_id"],
-                        request.class_name,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ]
-                )
-
-            if new_entries:
-                start_row = max(2, len(pointslog_rows) + 1)
-                end_row = start_row + len(new_entries) - 1
-                insert_url = (
-                    f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
-                    f"/items/{config['file_id']}/workbook/worksheets('PointsLog')/range(address='A{start_row}:L{end_row}')"
-                )
-                insert_response = await client.patch(
-                    insert_url,
-                    json={"values": new_entries},
-                    headers=headers,
-                )
-                if insert_response.status_code != 200:
-                    raise HTTPException(
-                        status_code=insert_response.status_code,
-                        detail=f"Failed to insert bootstrap rows: {insert_response.text}",
-                    )
-
-            return {
-                "message": "Bootstrap complete",
-                "entries_created": len(new_entries),
-                "date": normalized_date,
-                "class_name": request.class_name,
-                "total_students": len(class_students),
-            }
+        return {
+            "message": "Bootstrap complete" if result["total_students"] else "No students found for this class",
+            "entries_created": result["entries_created"],
+            "date": result["date"],
+            "class_name": bootstrap_request.class_name,
+            "total_students": result["total_students"],
+        }
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Bootstrap failed: {str(e)}")
+    except Exception:
+        logger.exception("Exception in bootstrap_pointslog_sheet")
+        raise HTTPException(status_code=500, detail="Bootstrap failed")
 
 
 @app.get("/sheets/classes")
 async def get_class_options(user_session: dict = Depends(require_authenticated_user)):
     """Get available class options"""
     return {
-        "classes": ["Journey_Boys", "Journey_Girls", "Trek", "T&T", "Cubbies"],
+        "classes": list(ALLOWED_CLASSES),
     }
 
 
@@ -1007,7 +1296,7 @@ async def fetch_students_sheet(
     try:
         print("📋 Fetching Students sheet...")
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             headers = {"Authorization": f"Bearer {access_token}"}
             try:
                 rows = await fetch_students_used_rows(client, headers)
@@ -1019,7 +1308,7 @@ async def fetch_students_sheet(
                 return {
                     "headers": ["StudentID", "Name", "Class"],
                     "data": [],
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
 
             print(f"✅ Retrieved {len(rows)} populated rows from Students sheet")
@@ -1035,13 +1324,11 @@ async def fetch_students_sheet(
             return {
                 "headers": headers_row,
                 "data": data_rows,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-    except Exception as e:
-        print(f"💥 Exception in fetch_students_sheet: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+    except Exception:
+        logger.exception("Exception in fetch_students_sheet")
+        raise HTTPException(status_code=500, detail="Server error")
 
 
 @app.get("/sheets/PointsLog")
@@ -1056,7 +1343,7 @@ async def fetch_pointslog_sheet(
     try:
         print("📋 Fetching PointsLog sheet (normalized)...")
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             headers = {"Authorization": f"Bearer {access_token}"}
             url = (
                 f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
@@ -1073,11 +1360,12 @@ async def fetch_pointslog_sheet(
                                "MemoryVerse", "Participation", "Bonus1_BAF1", "Bonus2_BAF2", 
                                "Bonus3_Participation", "TotalPoints"],
                     "data": [],
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             
             if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=f"Graph API error: {response.text}")
+                log_graph_error("fetch PointsLog", response)
+                raise HTTPException(status_code=response.status_code, detail="Graph API error")
             
             data = response.json()
             rows = data.get("values", [])
@@ -1090,262 +1378,71 @@ async def fetch_pointslog_sheet(
             return {
                 "headers": headers_row,
                 "data": data_rows,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-    except Exception as e:
-        print(f"💥 Exception in fetch_pointslog_sheet: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+    except Exception:
+        logger.exception("Exception in fetch_pointslog_sheet")
+        raise HTTPException(status_code=500, detail="Server error")
+
 
 
 @app.post("/sheets/PointsLog/auto-populate")
+@limiter.limit(WRITE_RATE_LIMIT, key_func=session_or_ip_key)
 async def auto_populate_new_date(
-    request: AutoPopulateRequest,
+    request: Request,
+    populate_request: AutoPopulateRequest,
     access_token: str = Depends(get_graph_access_token),
     user_session: dict = Depends(require_authenticated_user),
 ):
     """
-    Auto-populate PointsLog for a new date by creating empty entries for all students of the given class
+    Deprecated: use POST /sheets/PointsLogSheet/bootstrap.
+    Delegates to the same dedupe-aware routine, so existing rows are never duplicated.
     """
     try:
-        print(f"🆕 Auto-populating PointsLog for {request.date} ({request.class_name})")
-        normalized_date = normalize_date_str(request.date)
-        
-        async with httpx.AsyncClient() as client:
-            headers = {"Authorization": f"Bearer {access_token}"}
-            
-            # 1. Fetch populated students only
-            students_rows = _students_data_rows(await fetch_students_used_rows(client, headers))
-            if not isinstance(students_rows, list):
-                students_rows = []
-            
-            # Filter students for the given class
-            class_students = []
-            for row in students_rows:
-                if not isinstance(row, list):
-                    continue
-                if len(row) >= 3 and str(row[2]).strip() == request.class_name:
-                    class_students.append([row[0], row[1], row[2]])  # [StudentID, Name, Class]
-            
-            if not class_students:
-                print(f"⚠️ No students found for class: {request.class_name}")
-                return {"message": "No students found for this class", "entries_created": 0}
-            
-            # 2. Create entries for each student
-            new_entries = []
-            for student in class_students:
-                student_id = student[0]
-                # [Date, StudentID, Class, Attendance, Bible, BookAnswered, MemoryVerse, 
-                #  Participation, Bonus1_BAF1, Bonus2_BAF2, Bonus3_Participation, TotalPoints]
-                new_entries.append([
-                    normalized_date,  # Date
-                    student_id,    # StudentID
-                    request.class_name,  # Class
-                    0, 0, 0, 0, 0, 0, 0, 0, 0  # All points default to 0
-                ])
-            
-            # 3. Append entries to PointsLog sheet
-            pointslog_url = (
-                f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
-                f"/items/{config['file_id']}/workbook/worksheets('PointsLog')/range(address='A:L')"
+        print(f"🆕 Auto-populating PointsLog for {populate_request.date} ({populate_request.class_name})")
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+            result = await ensure_pointslog_rows_for_class(
+                client, headers, populate_request.date, populate_request.class_name
             )
-            
-            # Get current row count
-            count_response = await client.get(
-                pointslog_url,
-                headers=headers,
-            )
-            if count_response.status_code != 200:
-                raise HTTPException(status_code=400, detail=f"Failed to read PointsLog: {count_response.text}")
 
-            count_data = count_response.json() if count_response.content else {}
-            count_rows = (count_data.get("values") if isinstance(count_data, dict) else []) or []
-            if not isinstance(count_rows, list):
-                count_rows = []
-            next_row = len(count_rows) + 1
+        if not result["total_students"]:
+            message = "No students found for this class"
+        elif not result["entries_created"]:
+            message = "No entries to create"
+        else:
+            message = f"Auto-populated {result['entries_created']} students"
 
-            if not new_entries:
-                return {
-                    "message": "No entries to create",
-                    "entries_created": 0,
-                    "date": normalized_date,
-                    "class": request.class_name,
-                }
-            
-            # Write new entries
-            range_address = f"A{next_row}:L{next_row + len(new_entries) - 1}"
-            insert_url = (
-                f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
-                f"/items/{config['file_id']}/workbook/worksheets('PointsLog')/range(address='{range_address}')"
-            )
-            
-            insert_response = await client.patch(
-                insert_url,
-                json={"values": new_entries},
-                headers=headers,
-            )
-            
-            if insert_response.status_code == 200:
-                print(f"✅ Created {len(new_entries)} entries for {normalized_date}")
-                return {
-                    "message": f"Auto-populated {len(new_entries)} students",
-                    "entries_created": len(new_entries),
-                    "date": normalized_date,
-                    "class": request.class_name,
-                }
-
-            raise HTTPException(status_code=400, detail=f"Failed to insert entries: {insert_response.text}")
-            
-    except Exception as e:
-        print(f"💥 Exception in auto_populate_new_date: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        return {
+            "message": message,
+            "entries_created": result["entries_created"],
+            "date": result["date"],
+            "class": populate_request.class_name,
+        }
+    except Exception:
+        logger.exception("Exception in auto_populate_new_date")
+        raise HTTPException(status_code=500, detail="Server error")
 
 
 @app.patch("/sheets/PointsLog/update")
+@limiter.limit(WRITE_RATE_LIMIT, key_func=session_or_ip_key)
 async def update_student_pointslog(
-    update: StudentUpdate,
+    request: Request,
+    update: NormalizedStudentUpdate,
     access_token: str = Depends(get_graph_access_token),
     user_session: dict = Depends(require_authenticated_user),
 ):
     """
     Update a specific student's points in PointsLog sheet
-    Uses normalized structure with StudentID
+    Uses normalized structure; student_id is required.
     """
     try:
-        print(f"✏️ Updating points for {update.student_name} on {update.date}")
-        normalized_date = normalize_date_str(update.date)
-        
-        async with httpx.AsyncClient() as client:
-            headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-            
-            # 1. Use provided student_id when available; otherwise fall back to roster lookup.
-            student_id = str(update.student_id).strip() if update.student_id else None
-            if not student_id:
-                roster = await fetch_students_roster(client, headers)
-
-                student_id = None
-                for student in roster:
-                    if student["student_name"] == update.student_name and student["class_name"] == update.class_name:
-                        student_id = student["student_id"]
-                        break
-            
-            if student_id is None:
-                raise HTTPException(status_code=404, detail=f"Student {update.student_name} not found")
-            
-            # 2. Find existing row in PointsLog
-            pointslog_rows = await fetch_pointslog_rows(client, headers)
-            row_index = find_pointslog_row_index(pointslog_rows, normalized_date, student_id, update.class_name)
-            existing_score_values = []
-            
-            # 2b. Upsert: if missing, append row with defaults first
-            if row_index is None:
-                append_row = [
-                    normalized_date,
-                    str(student_id),
-                    update.class_name,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ]
-
-                existing_score_values = append_row[3:11]
-
-                row_index = max(2, len(pointslog_rows) + 1)
-                append_url = (
-                    f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
-                    f"/items/{config['file_id']}/workbook/worksheets('PointsLog')/range(address='A{row_index}:L{row_index}')"
-                )
-                append_response = await client.patch(
-                    append_url,
-                    json={"values": [append_row]},
-                    headers=headers,
-                )
-                if append_response.status_code != 200:
-                    raise HTTPException(
-                        status_code=append_response.status_code,
-                        detail=f"Failed to create missing PointsLog row: {append_response.text}",
-                    )
-            else:
-                existing_row = pointslog_rows[row_index - 1] if len(pointslog_rows) >= row_index else []
-                existing_score_values = existing_row[3:11] if isinstance(existing_row, list) else []
-            
-            # 3. Apply updates
-            updates = []
-            if update.attendance is not None:
-                updates.append(("D", update.attendance))
-            if update.bible is not None:
-                updates.append(("E", update.bible))
-            if update.book_answered is not None:
-                updates.append(("F", update.book_answered))
-            if update.memory_verse is not None:
-                updates.append(("G", update.memory_verse))
-            if update.participation is not None:
-                updates.append(("H", update.participation))
-            if update.bonus1_baf_1 is not None:
-                updates.append(("I", update.bonus1_baf_1))
-            if update.bonus2_baf_2 is not None:
-                updates.append(("J", update.bonus2_baf_2))
-            if update.bonus3_participation is not None:
-                updates.append(("K", update.bonus3_participation))
-            # Do not trust client total_points under concurrent toggles; server recalculates from D:K.
-            
-            # Apply all updates
-            for column, value in updates:
-                cell_address = f"{column}{row_index}"
-                update_url = (
-                    f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
-                    f"/items/{config['file_id']}/workbook/worksheets('PointsLog')/range(address='{cell_address}')"
-                )
-                
-                update_response = await client.patch(
-                    update_url,
-                    json={"values": [[value]]},
-                    headers=headers,
-                )
-                if update_response.status_code != 200:
-                    print(f"❌ Error updating {cell_address}: {update_response.text}")
-                    raise HTTPException(status_code=400, detail=f"Failed to update cell {cell_address}")
-
-            # 4. Recalculate total points from the in-memory row snapshot with the new update applied.
-            score_values = apply_update_to_score_values(existing_score_values, update)
-            computed_total = calculate_total_points_from_row_values(score_values)
-
-            total_cell_address = f"L{row_index}"
-            total_update_url = (
-                f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
-                f"/items/{config['file_id']}/workbook/worksheets('PointsLog')/range(address='{total_cell_address}')"
-            )
-            total_update_response = await client.patch(
-                total_update_url,
-                json={"values": [[computed_total]]},
-                headers=headers,
-            )
-            if total_update_response.status_code != 200:
-                raise HTTPException(status_code=400, detail=f"Failed to update total points at {total_cell_address}")
-            
-            return {
-                "success": True,
-                "message": f"Updated {update.student_name} on {normalized_date}",
-                "row_updated": row_index,
-                "total_points": computed_total,
-            }
-    
+        return await apply_pointslog_update(update, access_token, allow_name_lookup=False)
     except HTTPException:
         raise
-    except Exception as e:
-        print(f"💥 Exception in update_student_pointslog: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Exception in update_student_pointslog")
+        raise HTTPException(status_code=500, detail="Server error")
 
 
 @app.get("/sheets/student-summary")
@@ -1357,110 +1454,81 @@ async def get_student_summary(
     """
     Get accumulated points per student grouped by Class then StudentID
     Optional: Filter by specific class_name (e.g., "Journey_Boys")
-    Returns: { "Journey_Boys": [ {name, total_points}, ... ], "Journey_Girls": [ ... ], ... }
+    Returns: { "Journey_Boys": [ {student_id, name, total_points}, ... ], ... }
     Sorted by highest points first within each class
     """
     try:
         print(f"📊 Fetching student summary (class_filter: {class_filter})...")
-        
-        async with httpx.AsyncClient() as client:
+
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             headers = {"Authorization": f"Bearer {access_token}"}
-            
-            # Fetch PointsLog sheet
-            pointslog_url = (
-                f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
-                f"/items/{config['file_id']}/workbook/worksheets('PointsLog')/range(address='A1:L10000')"
-            )
-            
-            pointslog_response = await client.get(pointslog_url, headers=headers)
-            
+
+            pointslog_response = await client.get(pointslog_range_url("A1:L10000"), headers=headers)
+
             if pointslog_response.status_code == 404:
                 return {
                     "summary": {},
                     "total_students": 0,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
-            
+
             if pointslog_response.status_code != 200:
-                raise HTTPException(status_code=pointslog_response.status_code, detail=f"Graph API error fetching PointsLog")
-            
-            # Fetch only populated Students rows for name mapping
+                log_graph_error("fetch PointsLog summary", pointslog_response)
+                raise HTTPException(status_code=pointslog_response.status_code, detail="Graph API error fetching PointsLog")
+
+            # Fetch only populated Students rows for display-name mapping
             students_rows = _students_data_rows(await fetch_students_used_rows(client, headers))
-            
+
             id_to_name = {}
             for row in students_rows:
                 if len(row) >= 2:
-                    student_id = row[0]
-                    name = str(row[1]).strip()
-                    id_to_name[student_id] = name
-            
-            # Process PointsLog data
+                    id_to_name[str(row[0]).strip()] = str(row[1]).strip()
+
             pointslog_data = pointslog_response.json()
             pointslog_rows = pointslog_data.get("values", [])
-            
+
             # PointsLog structure: [Date, StudentID, Class, Att, Bible, BA, MV, Part, B1, B2, B3, TotalPoints]
             # Group by Class and StudentID, sum TotalPoints
-            summary = {}  # {class_name: {student_name: total_points}}
-            
+            summary = {}  # {class_name: {student_id: total_points}}
+
             for row in pointslog_rows[1:]:  # Skip header
-                if len(row) >= 12:
-                    student_id = row[1]
-                    class_name = row[2]
-                    total_points = row[11]
-                    
-                    # Convert to int if possible
-                    if total_points is None:
-                        total_points = 0
-                    else:
-                        try:
-                            total_points = int(total_points)
-                        except (ValueError, TypeError):
-                            total_points = 0
-                    
-                    # Apply class filter if provided
-                    if class_filter and class_name != class_filter:
-                        continue
-                    
-                    # Get student name
-                    student_name = id_to_name.get(student_id, f"Unknown({student_id})")
-                    
-                    # Initialize class dict if not exists
-                    if class_name not in summary:
-                        summary[class_name] = {}
-                    
-                    # Sum points for this student
-                    if student_name not in summary[class_name]:
-                        summary[class_name][student_name] = 0
-                    summary[class_name][student_name] += total_points
-            
-            # Convert to sorted list format and sort by points descending
+                if len(row) < 12:
+                    continue
+                student_id = str(row[1]).strip()
+                class_name = row[2]
+                if not student_id:
+                    continue
+
+                if class_filter and class_name != class_filter:
+                    continue
+
+                class_totals = summary.setdefault(class_name, {})
+                class_totals[student_id] = class_totals.get(student_id, 0) + safe_int(row[11], 0)
+
             formatted_summary = {}
             for class_name in sorted(summary.keys()):
                 students_list = [
                     {
-                        "name": name,
-                        "total_points": points
+                        "student_id": student_id,
+                        "name": id_to_name.get(student_id, f"Unknown({student_id})"),
+                        "total_points": points,
                     }
-                    for name, points in summary[class_name].items()
+                    for student_id, points in summary[class_name].items()
                 ]
-                # Sort by points descending
                 students_list.sort(key=lambda x: x["total_points"], reverse=True)
                 formatted_summary[class_name] = students_list
-            
-            # Count total unique students
+
             total_students = sum(len(students) for students in formatted_summary.values())
-            
+
             return {
                 "summary": formatted_summary,
                 "total_students": total_students,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-    
-    except Exception as e:
-        print(f"💥 Exception in get_student_summary: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+    except Exception:
+        logger.exception("Exception in get_student_summary")
+        raise HTTPException(status_code=500, detail="Server error")
 
 
 @app.get("/health")

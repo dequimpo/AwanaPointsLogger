@@ -29,7 +29,7 @@ services:
       - key: ENFORCE_GROUP_MEMBERSHIP
         value: "true"
       - key: FAIL_OPEN_ON_GROUP_CHECK_ERROR
-        value: "true"
+        value: "false"
       - key: ALLOWED_GROUP_NAME
         value: AwanaPointsLogger
       - key: ALLOWED_GROUP_ID

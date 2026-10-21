@@ -1,7 +1,11 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-httpx==0.25.2
-msal==1.25.0
-PyJWT==2.10.1
-pydantic==2.5.0
-python-dotenv==1.0.0
+# Pinning policy: pin exact versions (==) of direct dependencies for reproducible Docker builds.
+# Bump deliberately (Dependabot PRs or manual), preferring releases that have been out for
+# at least a couple of weeks, and keep CI's pip-audit step green.
+fastapi==0.142.4
+uvicorn==0.54.0
+httpx==0.28.1
+msal==1.39.0
+PyJWT[crypto]==2.15.1
+pydantic==2.13.5
+python-dotenv==1.2.4
+slowapi==0.1.10
