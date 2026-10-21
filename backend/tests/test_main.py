@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import json
@@ -8,7 +9,7 @@ import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -407,6 +408,86 @@ def test_populate_endpoints_skip_existing_rows(client, fake_graph, path):
     assert response.status_code == 200, response.text
     assert response.json()["entries_created"] == 1
     assert fake_graph.patches == [("A3:L3", [["2026-03-01", "S2", "Trek", 0, 0, 0, 0, 0, 0, 0, 0, 0]])]
+
+
+class StatefulGraph(FakeGraph):
+    """Applies PATCHes to its PointsLog and yields between requests to expose races."""
+
+    async def async_handler(self, request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.01)
+        url = str(request.url)
+        if request.method == "GET" and "worksheets('PointsLog')" in url:
+            return httpx.Response(200, json={"values": [list(row) for row in self.pointslog]})
+        response = self.handler(request)
+        if request.method == "PATCH":
+            address, values = self.patches[-1]
+            start, _end = address.split(":")
+            first_col = ord(start[0]) - ord("A")
+            row_number = int(start[1:])
+            for offset, row_values in enumerate(values):
+                index = row_number - 1 + offset
+                while len(self.pointslog) <= index:
+                    self.pointslog.append([""] * 12)
+                row = self.pointslog[index]
+                row[first_col : first_col + len(row_values)] = row_values
+        return response
+
+
+@pytest.fixture
+def stateful_graph(monkeypatch):
+    graph = StatefulGraph(
+        STUDENTS,
+        [
+            ["Date", "StudentID", "Class", "Att", "Bible", "BA", "MV", "Part", "B1", "B2", "B3", "Total"],
+            ["2026-03-01", "S1", "Trek", 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ],
+    )
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        main.httpx, "AsyncClient", lambda *a, **kw: real_client(transport=httpx.MockTransport(graph.async_handler))
+    )
+    monkeypatch.setattr(main, "_pointslog_write_lock", asyncio.Lock())
+    return graph
+
+
+@pytest.mark.anyio
+async def test_concurrent_score_updates_on_same_row_are_not_lost(stateful_graph):
+    def update(**fields):
+        return main.NormalizedStudentUpdate(
+            date="2026-03-01", class_name="Trek", student_name="Ann", student_id="S1", **fields
+        )
+
+    await asyncio.gather(
+        main.apply_pointslog_update(update(attendance=1), "t", allow_name_lookup=False),
+        main.apply_pointslog_update(update(bible=1), "t", allow_name_lookup=False),
+    )
+    assert stateful_graph.pointslog[1] == ["2026-03-01", "S1", "Trek", 1, 1, 0, 0, 0, 0, 0, 0, 20]
+
+
+@pytest.mark.anyio
+async def test_concurrent_class_population_does_not_overwrite_rows(stateful_graph):
+    stateful_graph.pointslog = stateful_graph.pointslog[:1]
+
+    async def populate(class_name):
+        async with httpx.AsyncClient(timeout=main.HTTP_TIMEOUT) as graph_client:
+            return await main.ensure_pointslog_rows_for_class(graph_client, {}, "2026-03-01", class_name)
+
+    await asyncio.gather(populate("Trek"), populate("Cubbies"))
+    keys = sorted((row[1], row[2]) for row in stateful_graph.pointslog[1:])
+    assert keys == [("S1", "Trek"), ("S2", "Trek"), ("S3", "Cubbies")]
+
+
+@pytest.mark.parametrize("trusted, expected", [(True, "203.0.113.9"), (False, "testclient")])
+def test_client_ip_key_only_trusts_forwarded_for_behind_proxy(monkeypatch, trusted, expected):
+    monkeypatch.setattr(main, "TRUST_PROXY_HEADERS", trusted)
+    request = Request(
+        {
+            "type": "http",
+            "headers": [(b"x-forwarded-for", b"1.2.3.4, 203.0.113.9")],
+            "client": ("testclient", 50000),
+        }
+    )
+    assert main.client_ip_key(request) == expected
 
 
 def test_student_summary_groups_by_student_id(client, fake_graph):
