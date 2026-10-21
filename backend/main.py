@@ -172,13 +172,19 @@ AUTH_RATE_LIMIT = os.getenv("AUTH_RATE_LIMIT", "10/minute")
 WRITE_RATE_LIMIT = os.getenv("WRITE_RATE_LIMIT", "120/minute")
 
 
+# Only trust X-Forwarded-For when a hosting proxy (e.g. Render) is the sole ingress; otherwise
+# clients could rotate the header to evade or exhaust rate limits.
+TRUST_PROXY_HEADERS = _env_bool("TRUST_PROXY_HEADERS", IS_PRODUCTION)
+
+
 def client_ip_key(request: Request) -> str:
-    """Client IP for rate limiting. Uses the right-most X-Forwarded-For hop (set by the
-    hosting proxy) because left-most entries are client-controlled."""
-    forwarded = request.headers.get("x-forwarded-for", "")
-    hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
-    if hops:
-        return hops[-1]
+    """Client IP for rate limiting. Behind a trusted proxy, uses the right-most
+    X-Forwarded-For hop (appended by the proxy) because left-most entries are client-controlled."""
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+        if hops:
+            return hops[-1]
     return get_remote_address(request)
 
 
@@ -1103,6 +1109,12 @@ async def fetch_points_sheet(
 
 
 
+# Serializes PointsLog read-modify-write cycles (row appends and score updates) so concurrent
+# requests can't allocate the same append range or overwrite each other's scores from stale
+# snapshots. Process-local: assumes a single uvicorn worker/instance (the Render deployment).
+_pointslog_write_lock = asyncio.Lock()
+
+
 def pointslog_range_url(address: str) -> str:
     return (
         f"https://graph.microsoft.com/v1.0/drives/{config['drive_id']}"
@@ -1123,42 +1135,43 @@ async def ensure_pointslog_rows_for_class(
     if not class_students:
         return {"date": normalized_date, "entries_created": 0, "total_students": 0}
 
-    pointslog_rows = await fetch_pointslog_rows(client, headers)
+    async with _pointslog_write_lock:
+        pointslog_rows = await fetch_pointslog_rows(client, headers)
 
-    existing_keys = set()
-    for row in pointslog_rows[1:]:
-        if len(row) < 3:
-            continue
-        existing_keys.add(
-            (
-                normalize_date_str(row[0]),
-                str(row[1]).strip(),
-                str(row[2]).strip(),
+        existing_keys = set()
+        for row in pointslog_rows[1:]:
+            if len(row) < 3:
+                continue
+            existing_keys.add(
+                (
+                    normalize_date_str(row[0]),
+                    str(row[1]).strip(),
+                    str(row[2]).strip(),
+                )
             )
-        )
 
-    new_entries = []
-    for student in class_students:
-        key = (normalized_date, student["student_id"], class_name)
-        if key in existing_keys:
-            continue
-        # [Date, StudentID, Class, Att, Bible, BA, MV, Part, B1, B2, B3, TotalPoints]
-        new_entries.append([normalized_date, student["student_id"], class_name, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        new_entries = []
+        for student in class_students:
+            key = (normalized_date, student["student_id"], class_name)
+            if key in existing_keys:
+                continue
+            # [Date, StudentID, Class, Att, Bible, BA, MV, Part, B1, B2, B3, TotalPoints]
+            new_entries.append([normalized_date, student["student_id"], class_name, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 
-    if new_entries:
-        start_row = max(2, len(pointslog_rows) + 1)
-        end_row = start_row + len(new_entries) - 1
-        insert_response = await client.patch(
-            pointslog_range_url(f"A{start_row}:L{end_row}"),
-            json={"values": new_entries},
-            headers=headers,
-        )
-        if insert_response.status_code != 200:
-            log_graph_error("insert PointsLog rows", insert_response)
-            raise HTTPException(
-                status_code=insert_response.status_code,
-                detail="Failed to insert PointsLog rows",
+        if new_entries:
+            start_row = max(2, len(pointslog_rows) + 1)
+            end_row = start_row + len(new_entries) - 1
+            insert_response = await client.patch(
+                pointslog_range_url(f"A{start_row}:L{end_row}"),
+                json={"values": new_entries},
+                headers=headers,
             )
+            if insert_response.status_code != 200:
+                log_graph_error("insert PointsLog rows", insert_response)
+                raise HTTPException(
+                    status_code=insert_response.status_code,
+                    detail="Failed to insert PointsLog rows",
+                )
 
     return {
         "date": normalized_date,
@@ -1186,35 +1199,36 @@ async def apply_pointslog_update(update: StudentUpdate, access_token: str, allow
         if not student_id:
             raise HTTPException(status_code=404, detail=f"Student {update.student_name} not found")
 
-        pointslog_rows = await fetch_pointslog_rows(client, headers)
-        row_index = find_pointslog_row_index(pointslog_rows, normalized_date, student_id, update.class_name)
+        async with _pointslog_write_lock:
+            pointslog_rows = await fetch_pointslog_rows(client, headers)
+            row_index = find_pointslog_row_index(pointslog_rows, normalized_date, student_id, update.class_name)
 
-        if row_index is None:
-            existing_score_values = [0] * 8
-        else:
-            existing_row = pointslog_rows[row_index - 1] if len(pointslog_rows) >= row_index else []
-            existing_score_values = existing_row[3:11] if isinstance(existing_row, list) else []
+            if row_index is None:
+                existing_score_values = [0] * 8
+            else:
+                existing_row = pointslog_rows[row_index - 1] if len(pointslog_rows) >= row_index else []
+                existing_score_values = existing_row[3:11] if isinstance(existing_row, list) else []
 
-        # Do not trust client total_points; server recalculates from D:K.
-        score_values = apply_update_to_score_values(existing_score_values, update)
-        computed_total = calculate_total_points_from_row_values(score_values)
+            # Do not trust client total_points; server recalculates from D:K.
+            score_values = apply_update_to_score_values(existing_score_values, update)
+            computed_total = calculate_total_points_from_row_values(score_values)
 
-        if row_index is None:
-            row_index = max(2, len(pointslog_rows) + 1)
-            address = f"A{row_index}:L{row_index}"
-            row_values = [normalized_date, student_id, update.class_name, *score_values, computed_total]
-        else:
-            address = f"D{row_index}:L{row_index}"
-            row_values = [*score_values, computed_total]
+            if row_index is None:
+                row_index = max(2, len(pointslog_rows) + 1)
+                address = f"A{row_index}:L{row_index}"
+                row_values = [normalized_date, student_id, update.class_name, *score_values, computed_total]
+            else:
+                address = f"D{row_index}:L{row_index}"
+                row_values = [*score_values, computed_total]
 
-        write_response = await client.patch(
-            pointslog_range_url(address),
-            json={"values": [row_values]},
-            headers=headers,
-        )
-        if write_response.status_code != 200:
-            log_graph_error(f"update PointsLog {address}", write_response)
-            raise HTTPException(status_code=400, detail="Failed to update PointsLog row")
+            write_response = await client.patch(
+                pointslog_range_url(address),
+                json={"values": [row_values]},
+                headers=headers,
+            )
+            if write_response.status_code != 200:
+                log_graph_error(f"update PointsLog {address}", write_response)
+                raise HTTPException(status_code=400, detail="Failed to update PointsLog row")
 
         return {
             "success": True,
